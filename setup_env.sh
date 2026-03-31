@@ -62,7 +62,16 @@ echo "  Installing simple-knn..."
 TORCH_CUDA_ARCH_LIST="9.0;12.0" \
     conda run -n "$ENV_NAME" pip install submodules/simple-knn --no-build-isolation
 
-# ── 5. Verify ─────────────────────────────────────────────────────────────────
+# ── 5. Download D-NeRF dataset ─────────────────────────────────────────────────
+echo "=== [5/5] Downloading D-NeRF dataset ==="
+mkdir -p data/dnerf
+FILE_ID="1uHVyApwqugXTFuIRRlE4abTW8_rrVeIK"
+wget -O data/dnerf/data.zip \
+    "https://drive.google.com/uc?export=download&id=${FILE_ID}"
+unzip data/dnerf/data.zip -d data/dnerf/
+rm data/dnerf/data.zip
+
+# ── 6. Verify ─────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Verifying installation ==="
 conda run -n "$ENV_NAME" python -c "
