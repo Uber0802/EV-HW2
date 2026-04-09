@@ -30,7 +30,7 @@ def quaternion_multiply(q1, q2):
 
 
 def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, d_xyz, d_rotation, d_scaling, is_6dof=False,
-           scaling_modifier=1.0, override_color=None, absolute_deform=False):
+           scaling_modifier=1.0, override_color=None, absolute_deform=False, scores=None):
     """
     Render the scene.
 
@@ -39,8 +39,10 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, d_
 
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
     screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
+    screenspace_points_densify = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
     try:
         screenspace_points.retain_grad()
+        screenspace_points_densify.retain_grad()
     except:
         pass
 
@@ -110,22 +112,41 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, d_
     else:
         colors_precomp = override_color
 
+    if scores is None:
+        scores = torch.zeros_like(opacity)
+
     # Rasterize visible Gaussians to image, obtain their radii (on screen).
-    rendered_image, radii, depth = rasterizer(
-        means3D=means3D,
-        means2D=screenspace_points,
-        shs=shs,
-        colors_precomp=colors_precomp,
-        opacities=opacity,
-        scales=scales,
-        rotations=rotations,
-        cov3D_precomp=cov3D_precomp)
+    # Newer SpeeDe3DGS-style rasterizers accept a `scores` tensor used for
+    # score-based pruning. Fall back for older rasterizer builds.
+    try:
+        rendered_image, radii, depth = rasterizer(
+            means3D=means3D,
+            means2D=screenspace_points,
+            means2D_densify=screenspace_points_densify,
+            shs=shs,
+            colors_precomp=colors_precomp,
+            opacities=opacity,
+            scores=scores,
+            scales=scales,
+            rotations=rotations,
+            cov3D_precomp=cov3D_precomp)
+    except TypeError:
+        rendered_image, radii, depth = rasterizer(
+            means3D=means3D,
+            means2D=screenspace_points,
+            means2D_densify=screenspace_points_densify,
+            shs=shs,
+            colors_precomp=colors_precomp,
+            opacities=opacity,
+            scales=scales,
+            rotations=rotations,
+            cov3D_precomp=cov3D_precomp)
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
     return {"render": rendered_image,
             "viewspace_points": screenspace_points,
-            "viewspace_points_densify": screenspace_points,  # same tensor; used for densification grad
+            "viewspace_points_densify": screenspace_points_densify,
             "visibility_filter": radii > 0,
             "radii": radii,
             "depth": depth}

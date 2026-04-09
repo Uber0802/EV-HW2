@@ -112,7 +112,9 @@ class DeformModel:
                 max_steps=training_args.deform_lr_max_steps)
 
         elif self.method == "4dgs":
-            # Separate LR for MLP and HexPlane grid
+            # Separate LR for MLP and HexPlane grid. Schedule length matches hustvl/4DGaussians
+            # gaussian_model.training_setup: deformation + grid use position_lr_max_steps (not a
+            # separate deform max_steps).
             l = [
                 {'params': list(self.deform.get_mlp_parameters()),
                  'lr': training_args.deformation_lr_init * self.spatial_lr_scale,
@@ -122,16 +124,17 @@ class DeformModel:
                  'name': 'deform_grid'},
             ]
             self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+            _lr_steps = training_args.position_lr_max_steps
             self.mlp_scheduler_args = get_expon_lr_func(
                 lr_init=training_args.deformation_lr_init * self.spatial_lr_scale,
                 lr_final=training_args.deformation_lr_final * self.spatial_lr_scale,
                 lr_delay_mult=training_args.deformation_lr_delay_mult,
-                max_steps=training_args.deform_lr_max_steps)
+                max_steps=_lr_steps)
             self.grid_scheduler_args = get_expon_lr_func(
                 lr_init=training_args.grid_lr_init * self.spatial_lr_scale,
                 lr_final=training_args.grid_lr_final * self.spatial_lr_scale,
                 lr_delay_mult=training_args.deformation_lr_delay_mult,
-                max_steps=training_args.deform_lr_max_steps)
+                max_steps=_lr_steps)
 
     # ── Checkpointing ─────────────────────────────────────────────────────────
 

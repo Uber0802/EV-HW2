@@ -45,6 +45,7 @@ class ModelParams(ParamGroup):
         self._resolution = -1
         self._white_background = True
         self.data_device = "cuda"
+        # Official repo defaults eval=True; argparse bool here defaults False — use --eval for D-NeRF parity
         self.eval = False
         self.load2gpu_on_the_fly = False
         # Deformable-3DGS flags
@@ -141,6 +142,38 @@ class OptimizationParams(ParamGroup):
         # ── Loss weights ──────────────────────────────────────────────────────
         self.percent_dense = 0.01
         self.lambda_dssim = 0.0
+        # 4DGS only (EV-HW2 extras; upstream has no nan_to_num / grad clip). Use 0 for parity.
+        self.stabilize_4dgs_loss = 0
+        self.grad_clip_norm_4dgs = 0.0
+
+        # SpeeDe3DGS-inspired acceleration tricks (deformable mode)
+        # 1) Temporal sensitivity sampling (TSS) in prune scoring
+        # 2) View-count normalization (VC) for pruning scores
+        # 3) Score-based temporal pruning schedule
+        self.enable_speede_tricks = False
+        self.speede_use_tss = False
+        self.speede_use_vc = False
+        self.speede_prune_from_iter = 6000
+        self.speede_prune_until_iter = 30000
+        self.speede_prune_interval = 3000
+        self.speede_densify_prune_ratio = 0.60
+        self.speede_after_densify_prune_ratio = 0.30
+
+        # SpeeDe3DGS GroupFlow options (deformable mode)
+        self.gflow_flag = False
+        self.gflow_iteration = 15000
+        self.gflow_num = 2048
+        self.gflow_opt = 2
+        self.gflow_xyz_lr = 1e-5
+        self.gflow_rotation_lr = 1e-7
+        self.gflow_translation_lr = 1e-7
+        self.gflow_radius_lr = 1e-7
+        self.gflow_local_rot = False
+        self.gflow_local_rot_for_train = False
+        self.LBS_flag = False
+        self.gflow_annealing_lr_flag = False
+        self.gflow_noise_flag = True
+        self.gflow_tnum_max = 200
 
         # ── Densification schedule ────────────────────────────────────────────
         self.densification_interval = 100

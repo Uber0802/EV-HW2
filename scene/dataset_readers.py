@@ -406,7 +406,8 @@ def readNerfiesCameras(path):
     coord_scale = scene_json['scale']
     scene_center = scene_json['center']
 
-    name = path.split('/')[-2]
+    # Use dataset folder name robustly (works with/without trailing slash).
+    name = Path(path).name
     if name.startswith('vrig'):
         train_img = dataset_json['train_ids']
         val_img = dataset_json['val_ids']

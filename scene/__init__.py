@@ -59,7 +59,12 @@ class Scene:
             print("Found calibration_full.json, assuming Dynamic-360 data set!")
             scene_info = sceneLoadTypeCallbacks["dynamic360"](args.source_path)
         else:
-            assert False, "Could not recognize scene type!"
+            assert False, (
+                "Could not recognize scene type! "
+                f"source_path='{args.source_path}'. "
+                "Expected one of: sparse/, transforms_train.json, cameras_sphere.npz, "
+                "dataset.json, poses_bounds.npy, transforms.json."
+            )
 
         if not self.loaded_iter:
             with open(scene_info.ply_path, 'rb') as src_file, open(os.path.join(self.model_path, "input.ply"),
@@ -96,6 +101,7 @@ class Scene:
                                                  "iteration_" + str(self.loaded_iter),
                                                  "point_cloud.ply"),
                                     og_number_points=len(scene_info.point_cloud.points))
+            self.gaussians.spatial_lr_scale = float(self.cameras_extent)
         else:
             self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
 

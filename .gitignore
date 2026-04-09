@@ -1,2 +1,7 @@
 submodules/
 data/
+datasets/
+output/
+other_doc/
+*.zip
+

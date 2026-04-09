@@ -24,6 +24,9 @@ from utils.general_utils import strip_symmetric, build_scaling_rotation
 
 class GaussianModel:
     def __init__(self, sh_degree: int):
+        # Set from create_from_pcd(..., cameras_extent) or Scene after load_ply — must match
+        # hustvl/4DGaussians (not a constant 5).
+        self.spatial_lr_scale = 1.0
 
         def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):
             L = build_scaling_rotation(scaling_modifier * scaling, rotation)
@@ -85,7 +88,7 @@ class GaussianModel:
             self.active_sh_degree += 1
 
     def create_from_pcd(self, pcd: BasicPointCloud, spatial_lr_scale: float):
-        self.spatial_lr_scale = 5
+        self.spatial_lr_scale = float(spatial_lr_scale)
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
         fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
@@ -114,14 +117,14 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
-        self.spatial_lr_scale = 5
-
+        # spatial_lr_scale comes from create_from_pcd (scene radius); do not overwrite here.
+        # Scaling / rotation LRs match hustvl/4DGaussians: no spatial_lr_scale on scaling.
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
             {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
             {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
             {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
-            {'params': [self._scaling], 'lr': training_args.scaling_lr * self.spatial_lr_scale, "name": "scaling"},
+            {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
         ]
 
@@ -403,6 +406,39 @@ class GaussianModel:
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
         self.prune_points(prune_mask)
         torch.cuda.empty_cache()
+
+    def prune_gaussians(self, percent, import_score, min_keep=1024):
+        """Prune by exact-count ranking (robust to tied scores)."""
+        num_before = self.get_xyz.shape[0]
+        if num_before == 0:
+            return torch.zeros(0, dtype=torch.bool, device="cuda")
+
+        scores = import_score.reshape(-1)
+        if scores.numel() != num_before:
+            raise ValueError(
+                f"prune_gaussians score size mismatch: got {scores.numel()} vs {num_before}"
+            )
+
+        min_keep = int(max(1, min(min_keep, num_before)))
+        max_prunable = num_before - min_keep
+        if max_prunable <= 0:
+            return torch.zeros(num_before, dtype=torch.bool, device=scores.device)
+
+        n_remove = int(float(percent) * num_before)
+        n_remove = max(0, min(n_remove, max_prunable))
+        if n_remove == 0:
+            return torch.zeros(num_before, dtype=torch.bool, device=scores.device)
+
+        remove_idx = torch.topk(scores, k=n_remove, largest=False).indices
+        prune_mask = torch.zeros(num_before, dtype=torch.bool, device=scores.device)
+        prune_mask[remove_idx] = True
+
+        self.prune_points(prune_mask)
+        num_after = self.get_xyz.shape[0]
+        print(
+            f"\n[SpeeDePrune] Gaussians before: {num_before}, after: {num_after}, removed: {num_before - num_after}"
+        )
+        return prune_mask
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter, :2], dim=-1,

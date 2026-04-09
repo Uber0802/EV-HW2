@@ -15,6 +15,7 @@ Supports two methods via --method flag:
 """
 
 import os
+import json
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim
@@ -27,7 +28,9 @@ import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
+from pprint import pformat
 from arguments import ModelParams, PipelineParams, OptimizationParams, ModelHiddenParams
+from utils.rigid_utils import do_group_flow, step_group_flow
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -58,6 +61,99 @@ def _add_deform_to_optimizer(gaussians, deform, opt):
         'lr': opt.grid_lr_init * spatial_lr,
         'name': 'deform_grid',
     })
+
+
+def _set_unified_deform_learning_rates(gaussians, deform, iteration: int):
+    """Apply DeformModel LR schedulers to deform_mlp / deform_grid in gaussians.optimizer.
+
+    The fine-stage optimizer is unified (Gaussian + HexPlane params in one Adam).
+    gaussians.update_learning_rate only updates the xyz group; deform.*_scheduler_args
+    must be written into the unified optimizer each step (deform.optimizer is unused).
+    """
+    for param_group in gaussians.optimizer.param_groups:
+        if param_group["name"] == "deform_mlp":
+            param_group["lr"] = deform.mlp_scheduler_args(iteration)
+        elif param_group["name"] == "deform_grid":
+            param_group["lr"] = deform.grid_scheduler_args(iteration)
+
+
+def _apply_speede_tricks_preset(opt):
+    """Enable all three SpeeDe3DGS-inspired tricks with one flag."""
+    if not opt.enable_speede_tricks:
+        return
+    print("[SpeeDeTricks] Enabled score-pruning + TSS + VC.")
+    opt.speede_use_tss = True
+    opt.speede_use_vc = True
+
+
+def _score_func_speede(
+    scores, view, gaussians, opt, pipe, background, deform, time_interval, is_6dof, gflow_model=None
+):
+    """Compute score contribution from one camera view."""
+    img_scores = torch.zeros_like(scores, requires_grad=True)
+
+    fid = view.fid
+    n_pts = gaussians.get_xyz.shape[0]
+    time_input = fid.unsqueeze(0).expand(n_pts, -1)
+    tss_noise = (
+        torch.randn(1, 1, device="cuda").expand(n_pts, -1) * time_interval
+        if opt.speede_use_tss else 0.0
+    )
+    with torch.no_grad():
+        if gflow_model is not None:
+            d_xyz, d_rotation, d_scaling = step_group_flow(gflow_model, opt, fid, gaussians)
+        else:
+            d_xyz, d_rotation, d_scaling = deform.step(gaussians.get_xyz.detach(), time_input + tss_noise)
+
+    render_pkg = render(
+        view, gaussians, pipe, background,
+        d_xyz, d_rotation, d_scaling, is_6dof,
+        scores=img_scores)
+    image = render_pkg["render"]
+    vis = render_pkg["visibility_filter"]
+
+    image.sum().backward()
+    if img_scores.grad is not None:
+        with torch.no_grad():
+            scores += img_scores.grad
+    else:
+        # Fallback for rasterizers without score-gradient output.
+        with torch.no_grad():
+            scores[vis] += 1.0
+    return vis
+
+
+def _prune_speede(scene, gaussians, dataset, opt, pipe, background, deform, time_interval, prune_ratio, gflow_model=None):
+    """SpeeDe3DGS-style score pruning pass."""
+    if gaussians.get_xyz.shape[0] <= 1024:
+        return
+    with torch.enable_grad():
+        pbar = tqdm(total=len(scene.getTrainCameras()), desc="SpeeDe score pruning")
+        scores = torch.zeros_like(gaussians.get_opacity)
+        view_counts = torch.zeros_like(scores, dtype=torch.int32)
+        for view in scene.getTrainCameras():
+            if dataset.load2gpu_on_the_fly:
+                view.load2device()
+            vis = _score_func_speede(
+                scores, view, gaussians, opt, pipe, background, deform,
+                time_interval, dataset.is_6dof, gflow_model=gflow_model)
+            with torch.no_grad():
+                view_counts[vis] += 1
+            if dataset.load2gpu_on_the_fly:
+                view.load2device('cpu')
+            if gaussians.optimizer is not None:
+                gaussians.optimizer.zero_grad(set_to_none=True)
+            if deform.optimizer is not None:
+                deform.optimizer.zero_grad()
+            pbar.update(1)
+        pbar.close()
+
+        if opt.speede_use_vc:
+            norm = torch.sqrt(view_counts.float() + 1e-6)
+            scores = scores / norm
+            scores[view_counts == 0] = -float("inf")
+
+        gaussians.prune_gaussians(prune_ratio, scores)
 
 
 # ── Single-stage training loop ────────────────────────────────────────────────
@@ -123,6 +219,8 @@ def scene_reconstruction(dataset, opt, hyper, pipe,
 
         # ── LR update BEFORE forward pass (matches original line 138) ────────
         gaussians.update_learning_rate(iteration)
+        if stage == "fine" and dataset.method == "4dgs":
+            _set_unified_deform_learning_rates(gaussians, deform, iteration)
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
 
@@ -156,12 +254,22 @@ def scene_reconstruction(dataset, opt, hyper, pipe,
 
         # ── Photometric loss ──────────────────────────────────────────────────
         gt_image = viewpoint_cam.original_image.cuda()
-        Ll1  = l1_loss(image, gt_image)
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+        image_for_loss = image
+        if dataset.method == "4dgs" and int(getattr(opt, "stabilize_4dgs_loss", 1)) != 0:
+            image_for_loss = torch.clamp(
+                torch.nan_to_num(image, nan=0.5, posinf=1.0, neginf=0.0),
+                0.0, 1.0,
+            )
+        Ll1 = l1_loss(image_for_loss, gt_image)
+        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (
+            1.0 - ssim(image_for_loss, gt_image)
+        )
 
         # 4DGS HexPlane TV regularisation (fine stage only)
         if stage == "fine" and dataset.method == "4dgs":
-            loss = loss + deform.compute_regulation()
+            reg = deform.compute_regulation()
+            if torch.isfinite(reg).all():
+                loss = loss + reg
 
         # ── NaN guard: skip backward if loss invalid (original restarts; ──────
         # ── we skip to preserve the last good weights)                   ──────
@@ -174,6 +282,12 @@ def scene_reconstruction(dataset, opt, hyper, pipe,
             continue
 
         loss.backward()
+        clip_norm = getattr(opt, "grad_clip_norm_4dgs", 0.0)
+        if dataset.method == "4dgs" and clip_norm and clip_norm > 0.0:
+            torch.nn.utils.clip_grad_norm_(
+                [p for g in gaussians.optimizer.param_groups for p in g["params"]],
+                max_norm=float(clip_norm),
+            )
         iter_end.record()
 
         if dataset.load2gpu_on_the_fly:
@@ -280,6 +394,7 @@ def training_deformable(dataset, opt, pipe, hyper, testing_iterations, saving_it
     smooth_term = get_linear_noise_func(lr_init=0.1, lr_final=1e-15,
                                         lr_delay_mult=0.01, max_steps=20000)
     progress_bar = tqdm(range(opt.iterations), desc="Training progress")
+    gflow_model = None
 
     for iteration in range(1, opt.iterations + 1):
         if network_gui.conn is None:
@@ -305,6 +420,13 @@ def training_deformable(dataset, opt, pipe, hyper, testing_iterations, saving_it
         gaussians.update_learning_rate(iteration)
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
+        if (
+            opt.gflow_flag
+            and gflow_model is None
+            and iteration == int(opt.gflow_iteration)
+        ):
+            print("[GroupFlow] Building grouped motion model ...")
+            gflow_model = do_group_flow(gaussians, opt, dataset, scene, deform)
 
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
@@ -318,6 +440,11 @@ def training_deformable(dataset, opt, pipe, hyper, testing_iterations, saving_it
 
         if iteration < opt.warm_up:
             d_xyz, d_rotation, d_scaling = 0.0, 0.0, 0.0
+        elif gflow_model is not None:
+            fid_input = fid
+            if opt.gflow_noise_flag and not dataset.is_blender:
+                fid_input = torch.clamp(fid + torch.randn(1, device='cuda') * time_interval * smooth_term(iteration), 0.0, 1.0)
+            d_xyz, d_rotation, d_scaling = step_group_flow(gflow_model, opt, fid_input, gaussians)
         else:
             N = gaussians.get_xyz.shape[0]
             time_input = fid.unsqueeze(0).expand(N, -1)
@@ -339,6 +466,7 @@ def training_deformable(dataset, opt, pipe, hyper, testing_iterations, saving_it
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1  = l1_loss(image, gt_image)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+
         loss.backward()
         iter_end.record()
 
@@ -360,7 +488,7 @@ def training_deformable(dataset, opt, pipe, hyper, testing_iterations, saving_it
                 tb_writer, iteration, Ll1, loss, l1_loss,
                 iter_start.elapsed_time(iter_end),
                 testing_iterations, scene, render, (pipe, background),
-                deform, dataset, "fine")
+                deform, dataset, "fine", gflow_model=gflow_model, opt=opt)
             if iteration in testing_iterations:
                 if cur_psnr.item() > best_psnr:
                     best_psnr = cur_psnr.item()
@@ -370,6 +498,8 @@ def training_deformable(dataset, opt, pipe, hyper, testing_iterations, saving_it
                 print(f"\n[ITER {iteration}] Saving Gaussians")
                 scene.save(iteration)
                 deform.save_weights(dataset.model_path, iteration)
+                if gflow_model is not None and opt.gflow_flag:
+                    gflow_model.save_weights(dataset.model_path, iteration)
 
             if iteration < opt.densify_until_iter:
                 viewspace_point_tensor_densify = render_pkg["viewspace_points_densify"]
@@ -387,11 +517,31 @@ def training_deformable(dataset, opt, pipe, hyper, testing_iterations, saving_it
                             and iteration == opt.densify_from_iter)):
                     gaussians.reset_opacity()
 
+            if (
+                opt.enable_speede_tricks
+                and iteration >= opt.speede_prune_from_iter
+                and iteration < opt.speede_prune_until_iter
+                and iteration % max(1, opt.speede_prune_interval) == 0
+            ):
+                prune_ratio = (
+                    opt.speede_densify_prune_ratio
+                    if iteration < opt.densify_until_iter
+                    else opt.speede_after_densify_prune_ratio
+                )
+                _prune_speede(
+                    scene, gaussians, dataset, opt, pipe, background, deform,
+                    time_interval, prune_ratio, gflow_model=gflow_model)
+
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
                 if iteration >= opt.warm_up:
                     deform.optimizer.step()
                     deform.update_learning_rate(iteration)
+                if gflow_model is not None and opt.gflow_flag:
+                    gflow_model.optimizer.step()
+                    gflow_model.optimizer.zero_grad()
+                    if gflow_model.annealing_lr_flag:
+                        gflow_model.update_learning_rate(iteration)
                 gaussians.optimizer.zero_grad(set_to_none=True)
                 deform.optimizer.zero_grad()
 
@@ -400,8 +550,12 @@ def training_deformable(dataset, opt, pipe, hyper, testing_iterations, saving_it
 
 # ── Top-level training dispatcher ─────────────────────────────────────────────
 
-def training(dataset, opt, pipe, hyper, testing_iterations, saving_iterations):
-    tb_writer = prepare_output_and_logger(dataset)
+def training(dataset, opt, pipe, hyper, testing_iterations, saving_iterations, run_args=None):
+    # Store full CLI args when available for reproducibility.
+    log_args = run_args if run_args is not None else dataset
+    tb_writer = prepare_output_and_logger(log_args)
+    if run_args is not None:
+        dataset.model_path = run_args.model_path
 
     gaussians = GaussianModel(dataset.sh_degree)
     deform = DeformModel(
@@ -412,8 +566,13 @@ def training(dataset, opt, pipe, hyper, testing_iterations, saving_iterations):
     )
 
     scene = Scene(dataset, gaussians)
+    _apply_speede_tricks_preset(opt)
 
     if dataset.method == "4dgs":
+        # Schedulers for MLP + grid (used to set LR on unified optimizer each fine step).
+        deform.spatial_lr_scale = gaussians.spatial_lr_scale
+        deform.train_setting(opt)
+
         # Set HexPlane bounding box from initial point cloud
         xyz_np = gaussians.get_xyz.detach().cpu().numpy()
         deform.deform.deformation_net.set_aabb(
@@ -468,8 +627,16 @@ def prepare_output_and_logger(args):
 
     print("Output folder: {}".format(args.model_path))
     os.makedirs(args.model_path, exist_ok=True)
+    args_dict = vars(args)
+    # Keep cfg_args eval-compatible while making it human-readable.
     with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
-        cfg_log_f.write(str(Namespace(**vars(args))))
+        cfg_log_f.write("Namespace(\n")
+        for key in sorted(args_dict.keys()):
+            cfg_log_f.write(f"    {key}={pformat(args_dict[key])},\n")
+        cfg_log_f.write(")\n")
+    # Add JSON copy for easier downstream parsing/experiment diffing.
+    with open(os.path.join(args.model_path, "cfg_args.json"), 'w') as cfg_json_f:
+        json.dump(args_dict, cfg_json_f, indent=2, sort_keys=True)
 
     tb_writer = None
     if TENSORBOARD_FOUND:
@@ -481,7 +648,7 @@ def prepare_output_and_logger(args):
 
 def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed,
                     testing_iterations, scene: Scene, renderFunc, renderArgs,
-                    deform, dataset, stage):
+                    deform, dataset, stage, gflow_model=None, opt=None):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
@@ -509,7 +676,11 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed,
                     xyz = scene.gaussians.get_xyz
                     time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
 
-                    if stage == "fine":
+                    if gflow_model is not None and opt is not None:
+                        d_xyz, d_rotation, d_scaling = step_group_flow(
+                            gflow_model, opt, fid, scene.gaussians,
+                            use_precomputed_interp=True)
+                    elif stage == "fine":
                         d_xyz, d_rotation, d_scaling = deform.step(
                             xyz.detach(), time_input, gaussians=scene.gaussians)
                     else:
@@ -550,9 +721,16 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed,
                         config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
 
         if tb_writer:
-            tb_writer.add_histogram(
-                "scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
-            tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
+            n_pts = scene.gaussians.get_xyz.shape[0]
+            tb_writer.add_scalar('total_points', n_pts, iteration)
+            if n_pts > 0:
+                op = scene.gaussians.get_opacity.detach().reshape(-1)
+                op = torch.nan_to_num(op, nan=0.0, posinf=1.0, neginf=0.0)
+                if op.numel() > 0 and torch.isfinite(op).all():
+                    try:
+                        tb_writer.add_histogram("scene/opacity_histogram", op, iteration)
+                    except (ValueError, RuntimeError):
+                        pass
         torch.cuda.empty_cache()
 
     return test_psnr
@@ -584,6 +762,6 @@ if __name__ == "__main__":
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
 
     training(lp.extract(args), op.extract(args), pp.extract(args), hp.extract(args),
-             args.test_iterations, args.save_iterations)
+             args.test_iterations, args.save_iterations, run_args=args)
 
     print("\nTraining complete.")

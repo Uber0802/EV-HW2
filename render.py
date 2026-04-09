@@ -19,14 +19,16 @@ import torchvision
 from utils.general_utils import safe_state
 from utils.pose_utils import pose_spherical, render_wander_path
 from argparse import ArgumentParser
-from arguments import ModelParams, PipelineParams, ModelHiddenParams, get_combined_args
+from arguments import ModelParams, PipelineParams, ModelHiddenParams, OptimizationParams, get_combined_args
 import imageio
 import numpy as np
 import time
+from utils.rigid_utils import GroupFlowModel, GroupFlowModel_v2, step_group_flow
 
 
 def render_set(model_path, load2gpu_on_the_fly, is_6dof, name, iteration,
-               views, gaussians, pipeline, background, deform, method="deformable"):
+               views, gaussians, pipeline, background, deform, method="deformable",
+               opt=None, gflow_model=None):
     render_path = os.path.join(model_path, name, f"ours_{iteration}", "renders")
     gts_path    = os.path.join(model_path, name, f"ours_{iteration}", "gt")
     depth_path  = os.path.join(model_path, name, f"ours_{iteration}", "depth")
@@ -43,7 +45,11 @@ def render_set(model_path, load2gpu_on_the_fly, is_6dof, name, iteration,
         fid        = view.fid
         xyz        = gaussians.get_xyz
         time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
-        d_xyz, d_rotation, d_scaling = deform.step(xyz.detach(), time_input, gaussians=gaussians)
+        if gflow_model is not None and opt is not None:
+            d_xyz, d_rotation, d_scaling = step_group_flow(
+                gflow_model, opt, fid, gaussians, use_precomputed_interp=True)
+        else:
+            d_xyz, d_rotation, d_scaling = deform.step(xyz.detach(), time_input, gaussians=gaussians)
         results  = render(view, gaussians, pipeline, background, d_xyz, d_rotation, d_scaling, is_6dof,
                           absolute_deform=(method == "4dgs"))
         rendering = results["render"]
@@ -62,7 +68,11 @@ def render_set(model_path, load2gpu_on_the_fly, is_6dof, name, iteration,
         time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
         torch.cuda.synchronize()
         t_start = time.time()
-        d_xyz, d_rotation, d_scaling = deform.step(xyz.detach(), time_input, gaussians=gaussians)
+        if gflow_model is not None and opt is not None:
+            d_xyz, d_rotation, d_scaling = step_group_flow(
+                gflow_model, opt, fid, gaussians, use_precomputed_interp=True)
+        else:
+            d_xyz, d_rotation, d_scaling = deform.step(xyz.detach(), time_input, gaussians=gaussians)
         render(view, gaussians, pipeline, background, d_xyz, d_rotation, d_scaling, is_6dof,
                absolute_deform=(method == "4dgs"))
         torch.cuda.synchronize()
@@ -75,7 +85,8 @@ def render_set(model_path, load2gpu_on_the_fly, is_6dof, name, iteration,
 
 
 def interpolate_time(model_path, load2gpu_on_the_fly, is_6dof, name, iteration,
-                     views, gaussians, pipeline, background, deform, method="deformable"):
+                     views, gaussians, pipeline, background, deform, method="deformable",
+                     opt=None, gflow_model=None):
     render_path = os.path.join(model_path, name, f"interpolate_{iteration}", "renders")
     makedirs(render_path, exist_ok=True)
     to8b = lambda x: (255 * np.clip(x, 0, 1)).astype(np.uint8)
@@ -88,7 +99,11 @@ def interpolate_time(model_path, load2gpu_on_the_fly, is_6dof, name, iteration,
         fid        = torch.Tensor([t / (frame - 1)]).cuda()
         xyz        = gaussians.get_xyz
         time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
-        d_xyz, d_rotation, d_scaling = deform.step(xyz.detach(), time_input, gaussians=gaussians)
+        if gflow_model is not None and opt is not None:
+            d_xyz, d_rotation, d_scaling = step_group_flow(
+                gflow_model, opt, fid, gaussians, use_precomputed_interp=True)
+        else:
+            d_xyz, d_rotation, d_scaling = deform.step(xyz.detach(), time_input, gaussians=gaussians)
         results   = render(view, gaussians, pipeline, background, d_xyz, d_rotation, d_scaling, is_6dof,
                            absolute_deform=(method == "4dgs"))
         rendering = results["render"]
@@ -99,7 +114,7 @@ def interpolate_time(model_path, load2gpu_on_the_fly, is_6dof, name, iteration,
     imageio.mimwrite(os.path.join(render_path, 'video.mp4'), renderings, fps=30, quality=8)
 
 
-def render_sets(dataset: ModelParams, hyper, iteration: int,
+def render_sets(dataset: ModelParams, hyper, opt, iteration: int,
                 pipeline: PipelineParams, skip_train: bool, skip_test: bool,
                 mode: str):
     with torch.no_grad():
@@ -122,17 +137,33 @@ def render_sets(dataset: ModelParams, hyper, iteration: int,
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
         render_func = render_set if mode == "render" else interpolate_time
+        gflow_model = None
+        if opt.gflow_flag:
+            try:
+                if opt.gflow_opt == 1:
+                    gflow_model = GroupFlowModel()
+                else:
+                    gflow_model = GroupFlowModel_v2()
+                gflow_model.load_weights(dataset.model_path, iteration=scene.loaded_iter)
+                if hasattr(gflow_model, "precompute_interp"):
+                    try:
+                        gflow_model.precompute_interp(x=gaussians.get_xyz)
+                    except TypeError:
+                        gflow_model.precompute_interp()
+            except Exception as exc:
+                print(f"[GroupFlow] Failed to load weights, fallback to deform net: {exc}")
+                gflow_model = None
 
         if not skip_train:
             render_func(dataset.model_path, dataset.load2gpu_on_the_fly,
                         dataset.is_6dof, "train", scene.loaded_iter,
                         scene.getTrainCameras(), gaussians, pipeline,
-                        background, deform, method=dataset.method)
+                        background, deform, method=dataset.method, opt=opt, gflow_model=gflow_model)
         if not skip_test:
             render_func(dataset.model_path, dataset.load2gpu_on_the_fly,
                         dataset.is_6dof, "test", scene.loaded_iter,
                         scene.getTestCameras(), gaussians, pipeline,
-                        background, deform, method=dataset.method)
+                        background, deform, method=dataset.method, opt=opt, gflow_model=gflow_model)
 
 
 if __name__ == "__main__":
@@ -140,6 +171,7 @@ if __name__ == "__main__":
     model    = ModelParams(parser, sentinel=True)
     pipeline = PipelineParams(parser)
     hp       = ModelHiddenParams(parser)
+    op       = OptimizationParams(parser)
     parser.add_argument("--iteration",  default=-1,       type=int)
     parser.add_argument("--skip_train", action="store_true")
     parser.add_argument("--skip_test",  action="store_true")
@@ -150,5 +182,5 @@ if __name__ == "__main__":
     print("Rendering " + args.model_path)
 
     safe_state(args.quiet)
-    render_sets(model.extract(args), hp.extract(args), args.iteration,
+    render_sets(model.extract(args), hp.extract(args), op.extract(args), args.iteration,
                 pipeline.extract(args), args.skip_train, args.skip_test, args.mode)

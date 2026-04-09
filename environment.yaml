@@ -11,23 +11,7 @@ dependencies:
   # CUDA 12.8 toolkit – required for sm_120 (Blackwell / RTX 5090) support
   - cuda-toolkit=12.8.0
   - pip:
-    # PyTorch 2.7.0+cu128 – first release with Blackwell (sm_120) support
-    - torch==2.7.0+cu128 --extra-index-url https://download.pytorch.org/whl/cu128
-    - torchvision==0.22.0+cu128 --extra-index-url https://download.pytorch.org/whl/cu128
-    # Core 3DGS dependencies
-    - plyfile==0.8.1
-    - tqdm
-    - numpy<2
-    - Pillow
-    - imageio==2.27.0
-    - imageio-ffmpeg
-    - scipy
-    - opencv-python
-    # Metrics
-    - lpips
-    # Logging
-    - tensorboard
-    # CUDA extensions (built from local submodules – see setup_env.sh)
-    # Build with: TORCH_CUDA_ARCH_LIST="9.0;12.0" pip install submodules/... --no-build-isolation
-    # - submodules/diff-gaussian-rasterization
-    # - submodules/simple-knn
+    # Keep in sync with requirements.txt (or after `conda env create`, run:
+    #   pip install -r requirements.txt
+    - -r requirements.txt
+    # CUDA extensions: not installable from PyPI; build from submodules (see setup_env.sh)

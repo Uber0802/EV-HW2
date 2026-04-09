@@ -1,0 +1,19 @@
+# --- PyTorch (CUDA 12.8 wheels) ---
+# For other CUDA / CPU-only setups, replace these two lines using:
+#   https://pytorch.org/get-started/locally/
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.7.0+cu128
+torchvision==0.22.0+cu128
+
+# --- Runtime dependencies (pinned for reproducibility; relax versions if needed) ---
+plyfile==0.8.1
+tqdm==4.67.3
+numpy==1.26.4
+Pillow==12.1.1
+imageio==2.27.0
+imageio-ffmpeg==0.6.0
+scipy==1.15.3
+opencv-python==4.11.0.86
+lpips==0.1.4
+tensorboard==2.20.0
+matplotlib==3.10.8
