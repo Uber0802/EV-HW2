@@ -187,6 +187,13 @@ class DeformModel:
         l1_planes    = torch.tensor(0.0, device="cuda")   # _l1_regulation
         # itertools.combinations(range(4), 2) order:
         #   0:(0,1)=xy  1:(0,2)=xz  2:(0,3)=xt  3:(1,2)=yz  4:(1,3)=yt  5:(2,3)=zt
+
+        ## TODO: Implement plane smoothness and l1 regulation
+        # Accumulate regularization across all multi-resolution HexPlane levels.
+        # Plane index mapping (from combinations over x,y,z,t):
+        #   0:xy, 1:xz, 2:xt, 3:yz, 4:yt, 5:zt
+        # Spatial smoothness is applied to pure spatial planes.
+        # Temporal penalties are applied to planes that include t.
         for grids in multi_res_grids:
             if len(grids) == 3:
                 spatial_ids = list(range(3))
@@ -202,3 +209,4 @@ class DeformModel:
         return (self.hyper.plane_tv_weight       * plane_smooth
                 + self.hyper.time_smoothness_weight * time_smooth
                 + self.hyper.l1_time_planes         * l1_planes)
+        ## TODO: End of plane smoothness and l1 regulation

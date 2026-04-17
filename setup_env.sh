@@ -12,7 +12,8 @@
 #   For faster builds, set only your GPU's compute capability, e.g.:
 #     export TORCH_CUDA_ARCH_LIST=8.6    # RTX 30xx
 #     export TORCH_CUDA_ARCH_LIST=8.9    # RTX 40xx
-#     export TORCH_CUDA_ARCH_LIST=9.0;12.0   # Hopper + Blackwell (example)
+#     export TORCH_CUDA_ARCH_LIST=9.0         # Hopper
+#     export TORCH_CUDA_ARCH_LIST=12.0        # Blackwell (requires CUDA 12.8+ nvcc)
 #   Reference: https://developer.nvidia.com/cuda-gpus
 #   Default below is a broad list so one checkout works on many lab machines
 #   (compile will be slower).
@@ -24,6 +25,8 @@ cd "$SCRIPT_DIR"
 ENV_NAME="${ENV_NAME:-ev_hw2}"
 
 # Broad default; override for a quicker, arch-specific build.
+# Includes Blackwell (12.0). Submodule setup.py will sanitize this automatically
+# when nvcc is older than 12.8.
 TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-7.5;8.0;8.6;8.9;9.0;12.0}"
 
 # --- 1. Create conda environment (optional; uncomment to bootstrap from scratch) ---

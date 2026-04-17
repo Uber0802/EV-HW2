@@ -23,7 +23,7 @@ from arguments import ModelParams, PipelineParams, ModelHiddenParams, Optimizati
 import imageio
 import numpy as np
 import time
-from utils.rigid_utils import GroupFlowModel, GroupFlowModel_v2, step_group_flow
+from utils.rigid_utils import GroupFlowModel_v2, step_group_flow
 
 
 def render_set(model_path, load2gpu_on_the_fly, is_6dof, name, iteration,
@@ -47,7 +47,7 @@ def render_set(model_path, load2gpu_on_the_fly, is_6dof, name, iteration,
         time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
         if gflow_model is not None and opt is not None:
             d_xyz, d_rotation, d_scaling = step_group_flow(
-                gflow_model, opt, fid, gaussians, use_precomputed_interp=True)
+                gflow_model, fid, gaussians, use_precomputed_interp=True)
         else:
             d_xyz, d_rotation, d_scaling = deform.step(xyz.detach(), time_input, gaussians=gaussians)
         results  = render(view, gaussians, pipeline, background, d_xyz, d_rotation, d_scaling, is_6dof,
@@ -70,7 +70,7 @@ def render_set(model_path, load2gpu_on_the_fly, is_6dof, name, iteration,
         t_start = time.time()
         if gflow_model is not None and opt is not None:
             d_xyz, d_rotation, d_scaling = step_group_flow(
-                gflow_model, opt, fid, gaussians, use_precomputed_interp=True)
+                gflow_model, fid, gaussians, use_precomputed_interp=True)
         else:
             d_xyz, d_rotation, d_scaling = deform.step(xyz.detach(), time_input, gaussians=gaussians)
         render(view, gaussians, pipeline, background, d_xyz, d_rotation, d_scaling, is_6dof,
@@ -101,7 +101,7 @@ def interpolate_time(model_path, load2gpu_on_the_fly, is_6dof, name, iteration,
         time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
         if gflow_model is not None and opt is not None:
             d_xyz, d_rotation, d_scaling = step_group_flow(
-                gflow_model, opt, fid, gaussians, use_precomputed_interp=True)
+                gflow_model, fid, gaussians, use_precomputed_interp=True)
         else:
             d_xyz, d_rotation, d_scaling = deform.step(xyz.detach(), time_input, gaussians=gaussians)
         results   = render(view, gaussians, pipeline, background, d_xyz, d_rotation, d_scaling, is_6dof,
@@ -140,10 +140,7 @@ def render_sets(dataset: ModelParams, hyper, opt, iteration: int,
         gflow_model = None
         if opt.gflow_flag:
             try:
-                if opt.gflow_opt == 1:
-                    gflow_model = GroupFlowModel()
-                else:
-                    gflow_model = GroupFlowModel_v2()
+                gflow_model = GroupFlowModel_v2()
                 gflow_model.load_weights(dataset.model_path, iteration=scene.loaded_iter)
                 if hasattr(gflow_model, "precompute_interp"):
                     try:

@@ -337,146 +337,6 @@ def grouping_stage_one(gaussians, scene, dataset, deform, gnum=50, early_group_f
     return return_dict
 
 
-class GroupFlowModel():
-    def __init__(self):
-        self.spatial_lr_scale = 0.00001
-        self.version = 1
-    
-    def set_model(self, gflow_dict, training_args):
-        self.gflow = torch.nn.Parameter(gflow_dict["gflow_list"].requires_grad_(True))    # (Ng, T-1, 6)
-        self.gfmeans = gflow_dict["gflow_means"]  # (Ng, T, 3)
-        self.time_stamps = gflow_dict["time_stamps"]  # float: (T)
-        self.labels = gflow_dict["label_assignment"]    # int: (Np,)
-        self.group_num = self.gflow.shape[0]
-        self.frame_num = self.gflow.shape[1] + 1
-
-        self.set_optimizer(training_args)
-    
-    def set_optimizer(self, training_args):
-        l = [
-                {
-                    'params':[self.gflow], 
-                    'lr': 1e-4, 
-                    'name': 'group_lie'
-                }
-            ]
-        self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
-        
-        self.gflow_scheduler_args = get_expon_lr_func(
-            lr_init=training_args.position_lr_init * self.spatial_lr_scale,
-            lr_final=training_args.position_lr_final * self.spatial_lr_scale,
-            lr_delay_mult=training_args.position_lr_delay_mult,
-            max_steps=training_args.position_lr_max_steps
-        )
-
-    def update_learning_rate(self, iteration):
-        for param_group in self.optimizer.param_groups:
-            if param_group["name"] == "deform":
-                lr = self.deform_scheduler_args(iteration)
-                param_group['lr'] = lr
-                return lr
-
-    def save_weights(self, model_path, iteration):
-        out_weights_path = os.path.join(model_path, "gflow/iteration_{}".format(iteration))
-        os.makedirs(out_weights_path, exist_ok=True)
-        torch.save([self.gflow, self.time_stamps, self.labels], os.path.join(out_weights_path, 'deform.pth'))
-
-    def load_weights(self, model_path, iteration=-1):
-        if iteration == -1:
-            from utils.system_utils import searchForMaxIteration
-            loaded_iter = searchForMaxIteration(os.path.join(model_path, "deform"))
-        else:
-            loaded_iter = iteration
-        weights_path = os.path.join(model_path, "gflow/iteration_{}/deform.pth".format(loaded_iter))
-
-        gflow, time_stamps, labels = torch.load(weights_path, weights_only=False)
-
-        self.gflow = torch.nn.Parameter(gflow.requires_grad_(True))    # (Ng, T-1, 6)
-        self.time_stamps = time_stamps  # float: (T)
-        self.labels = labels    # int: (Np,)
-        self.group_num = self.gflow.shape[0]
-        self.frame_num = self.gflow.shape[1] + 1
-
-    def step_vid(self, vid):
-        """
-        vid: frame index (int)
-        """
-        if vid == 0:   # no deform applied
-            return 0
-        else:
-            # lie = self.gflow[:, time, :][labels, :]   # (Np, 6)
-            lie = self.gflow[:, vid-1, :]   # (Ng, 6)
-            R = exp_so3_batch(lie[:, :3])   # (Ng, 3, 3)
-            t = lie[:, 3:, None] # (Ng, 3)
-
-            bottom_row = torch.tensor([[0.0, 0.0, 0.0, 1.0]], device=R.device).repeat(R.shape[0], 1, 1)
-            gtransform = torch.cat([torch.cat([R, t], dim=-1), bottom_row], dim=1)   # (Ng, 4, 4)
-
-            ptransform = gtransform[self.labels, :, :]  # (Np, 4, 4)
-
-            return ptransform
-    
-    def precompute_interp(self):
-        delta_w_list = []
-        R_floor_list = []
-        for i in range(0, self.frame_num-1):
-            lie_ceil = self.gflow[:, i, :]
-            if i == 0:
-                lie_floor = torch.zeros_like(lie_ceil)
-            else:
-                lie_floor = self.gflow[:, i-1, :]
-            R_floor = exp_so3_batch(lie_floor[:, :3])   # (Ng, 3, 3)
-            R_ceil = exp_so3_batch(lie_ceil[:, :3])     # (Ng, 3, 3)
-            delta_R = R_floor.transpose(1,2) @ R_ceil       # (Ng, 3, 3)
-            delta_w = log_so3_batch(delta_R)                # (Ng, 3)
-            delta_w_list.append(delta_w)
-            R_floor_list.append(R_floor)
-        self.delta_w_list = torch.stack(delta_w_list, dim=1) # (Ng, T-1, 3)
-        self.R_floor_list = torch.stack(R_floor_list, dim=1) # (Ng, T-1, 3, 3)
-
-    def step_t(self, t, use_precomputed_interp=False):
-        """
-        t: frame stamp (float)
-        """
-        has_interp_cache = hasattr(self, "delta_w_list") and hasattr(self, "R_floor_list")
-        use_precomputed_interp = bool(use_precomputed_interp and has_interp_cache)
-
-        if t == 0:   # no deform applied
-            return 0
-        else:
-            vid_floor = torch.argwhere(self.time_stamps - t < 0)[-1].squeeze()
-            t_floor = self.time_stamps[vid_floor]
-            t_ceil = self.time_stamps[vid_floor+1]
-            ratio = (t - t_floor) / (t_ceil - t_floor)
-
-            lie_ceil = self.gflow[:, vid_floor, :]   # (Ng, 6)
-            if vid_floor == 0:
-                lie_floor = torch.zeros_like(lie_ceil)
-            else:
-                lie_floor = self.gflow[:, vid_floor-1, :]   # (Ng, 6)
-
-            if use_precomputed_interp:
-                delta_w = self.delta_w_list[:, vid_floor, :]
-                R_floor = self.R_floor_list[:, vid_floor, :, :]
-            else:
-                R_floor = exp_so3_batch(lie_floor[:, :3])   # (Ng, 3, 3)
-                R_ceil = exp_so3_batch(lie_ceil[:, :3])     # (Ng, 3, 3)
-                delta_R = R_floor.transpose(1,2) @ R_ceil       # (Ng, 3, 3)
-                delta_w = log_so3_batch(delta_R)                # (Ng, 3)
-
-            inference_R = exp_so3_batch(ratio * delta_w)    # (Ng, 3, 3)
-            R = R_floor @ inference_R   # (Ng, 3, 3)
-
-            t = lie_floor[:, 3:, None] * (1 - ratio) + lie_ceil[:, 3:, None] * (ratio) # (Ng, 3)
-
-            bottom_row = torch.tensor([[0.0, 0.0, 0.0, 1.0]], device=R.device).repeat(R.shape[0], 1, 1)
-            gtransform = torch.cat([torch.cat([R, t], dim=-1), bottom_row], dim=1).contiguous()   # (Ng, 4, 4)
-
-            ptransform = gtransform[self.labels, :, :]
-
-            return ptransform
-
-
 class GroupFlowModel_v2():
     """
     Translate version: borrow idea from SC-GS
@@ -630,7 +490,23 @@ class GroupFlowModel_v2():
 
     @torch.no_grad()
     def _refresh_point_labels(self, x, force=False, chunk_size=8192):
-        """Map each Gaussian to its nearest group node when point count changes."""
+        """Map each Gaussian point to one nearest GroupFlow node.
+
+        Why this exists:
+        - GroupFlow stores per-group motion (`self.gf_rotation`, `self.gf_translation`).
+        - To apply that motion to each Gaussian, we need a point->group index map.
+        - Densification/pruning can change point count during training, so cached labels
+          can become stale and must be recomputed.
+
+        Args:
+            x: (Np, 3) current Gaussian centers in canonical space.
+            force: if True, always recompute labels even if cached size matches.
+            chunk_size: split `x` to avoid OOM when computing cdist on large scenes.
+
+        Returns:
+            self.labels: (Np,) nearest group index for each Gaussian.
+        """
+        # Fast path: keep existing labels when they are still structurally valid.
         if (
             (not force)
             and hasattr(self, "labels")
@@ -639,39 +515,58 @@ class GroupFlowModel_v2():
         ):
             return self.labels
 
+        # Nearest-node assignment is a geometry query only; gradients are unnecessary.
         nodes = self.gf_nodes_xyz.detach()
         x_detached = x.detach()
         labels_chunks = []
+        # Chunked nearest-neighbor search: cdist(chunk, nodes) -> argmin over nodes.
         for start in range(0, x_detached.shape[0], chunk_size):
             end = min(start + chunk_size, x_detached.shape[0])
             dist = torch.cdist(x_detached[start:end], nodes)
             labels_chunks.append(torch.argmin(dist, dim=1))
+        # Persist labels for reuse in subsequent calls.
         self.labels = torch.cat(labels_chunks, dim=0).long()
         return self.labels
     
     def step_t_func(self, t, use_precomputed_interp=False):
+        """Interpolate per-group rigid transforms at timestamp `t`.
+
+        This returns one transform per group node:
+            gtransform[j] = [R_j(t) | T_j(t)]  with shape (3, 4)
+        where:
+        - R_j(t) is interpolated on SO(3) using Lie algebra delta between two
+          neighboring keyframes.
+        - T_j(t) is linearly interpolated in R^3 between those keyframes.
+
+        Args:
+            t: scalar normalized timestamp.
+            use_precomputed_interp: use cached rotation interpolation terms
+                (`delta_w_list`, `R_floor_list`) if available.
+
+        Returns:
+            0 if t is at/before canonical start time; otherwise tensor (Ng, 3, 4).
         """
-        t: frame stamp (float)
-        """
+        # Only enable cached path when cache tensors exist.
         has_interp_cache = hasattr(self, "delta_w_list") and hasattr(self, "R_floor_list")
         use_precomputed_interp = bool(use_precomputed_interp and has_interp_cache)
 
         if t <= self.time_stamps[0]:   # no deform applied
             return 0
         else:
-            # import pdb
-            # pdb.set_trace()
-
+            # Clamp to valid open interval [t0, t_last) to keep floor+1 index valid.
             t = torch.clip(t, self.time_stamps[0], self.time_stamps[-1] - 1e-5)
 
+            # Locate neighboring keyframes and interpolation ratio.
             vid_floor = torch.argwhere(self.time_stamps - t < 0)[-1].squeeze()
             t_floor = self.time_stamps[vid_floor]
             t_ceil = self.time_stamps[vid_floor+1]
             ratio = (t - t_floor) / (t_ceil - t_floor)
 
+            # Group motion parameters at ceil/floor keyframes.
             lie_ceil = self.gf_rotation[:, vid_floor, :]    # (Ng, 3)
             trans_ceil = self.gf_translation[:, vid_floor, :]  # (Ng, 3)
             if vid_floor == 0:
+                # Canonical frame has identity rotation and zero translation delta.
                 lie_floor = torch.zeros_like(lie_ceil)
                 trans_floor = torch.zeros_like(trans_ceil)
             else:
@@ -679,29 +574,53 @@ class GroupFlowModel_v2():
                 trans_floor = self.gf_translation[:, vid_floor-1, :]
 
             if use_precomputed_interp:
+                # Cached SO(3) interpolation terms from precompute_interp().
                 delta_w = self.delta_w_list[:, vid_floor, :]
                 R_floor = self.R_floor_list[:, vid_floor, :, :]
             else:
+                # Recompute SO(3) interpolation terms on-the-fly.
                 R_floor = self.exp_so3_batch(lie_floor[:, :3]).clone()   # (Ng, 3, 3)
                 R_ceil = self.exp_so3_batch(lie_ceil[:, :3])     # (Ng, 3, 3)
                 delta_R = R_floor.transpose(1,2) @ R_ceil       # (Ng, 3, 3)
                 delta_w = self.log_so3_batch(delta_R)                # (Ng, 3)
 
+            # Geodesic-like rotation interpolation in Lie algebra.
             inference_R = self.exp_so3_batch(ratio * delta_w)    # (Ng, 3, 3)
             R = R_floor @ inference_R   # (Ng, 3, 3)
 
+            # Linear interpolation for translation.
             T = trans_floor * (1 - ratio) + trans_ceil * (ratio) # (Ng, 3)
 
+            # Pack per-group transform as [R|T] for downstream point warping.
             gtransform = torch.cat([R, T[:,:,None]], dim=-1)      # (Ng, 3, 4)
-
             return gtransform
         
     def step_t(self, x, t, use_precomputed_interp=False, Q=None):
+        """Compute per-point translation offsets `d_xyz` at timestamp `t`.
+
+        Pipeline:
+        1) Interpolate per-group transforms via `step_t_func`.
+        2) Map each point to one nearest group via `_refresh_point_labels`.
+        3) Apply local rigid transform around that group's canonical node center.
+        4) Return displacement (deformed position - canonical position).
+
+        Args:
+            x: (Np, 3) canonical Gaussian centers.
+            t: scalar normalized timestamp.
+            use_precomputed_interp: enable cached interpolation terms when available.
+            Q: reserved for optional local-rotation branch in other variants.
+
+        Returns:
+            d_xyz: (Np, 3) displacement; returns scalar 0 at canonical time.
+        """
+        # This version uses hard nearest-group assignment (no LBS blending).
         LBS_flag = self.LBS_flag
+        # Cached rotation interpolation is optional and only valid if buffers exist.
         has_interp_cache = hasattr(self, "delta_w_list") and hasattr(self, "R_floor_list")
         use_precomputed_interp = bool(use_precomputed_interp and has_interp_cache)
 
         if LBS_flag and use_precomputed_interp:
+            # If LBS caches are missing or stale, disable cache path safely.
             has_lbs_cache = (
                 hasattr(self, "dist_all")
                 and hasattr(self, "labels_all")
@@ -710,66 +629,30 @@ class GroupFlowModel_v2():
             if (not has_lbs_cache) or self.labels_all.shape[0] != x.shape[0]:
                 use_precomputed_interp = False
 
+        # Canonical frame: no displacement.
         if t <= self.time_stamps[0]:
             if Q is None:
                 return 0
             else:
                 return 0, 0
         else:
+            ## TODO: Implement local rigid transform
+            # 1) Group-level transforms [R|T].
             gtransform = self.step_t_func(t, use_precomputed_interp)    # (Ng, 3, 4)
+            # 2) Per-point nearest group id.
+            point_labels = self._refresh_point_labels(x)
 
-            if LBS_flag:    ### Apply Linear Blend Skinning (KNN)
-                Knn = 5
-                if use_precomputed_interp:
-                    dist_all = self.dist_all
-                    labels_all = self.labels_all
-                    weights = self.weights
-                else:
-                    dist_all = torch.norm(x[:, None, :] - self.gf_nodes_xyz[None, :, :], dim=2) # (Np, Ng) distance under canonical space
-                    labels_all = torch.argsort(dist_all, dim=1)[:, :Knn]    # (Np, K)
-
-                    dist = torch.gather(dist_all, dim=1, index=labels_all)  # (Np, K)
-                    sigma = self.gf_nodes_radius[labels_all]                # (Np, K)
-                    weights = torch.exp( -dist / (2*sigma) )            # (Np, K)
-                    weights = weights / weights.sum(dim=1, keepdim=True)
-
-                ptransform = gtransform[labels_all, :, :]    # (Np, K, 3, 4)
-                R = ptransform[:, :, :, :3]     # (Np, K, 3, 3)
-                T = ptransform[:, :, :, 3]      # (Np, K, 3)
-                nodes = self.gf_nodes_xyz[labels_all, :]     # (Np, K, 3)
-                d_xyz_K = (R @ (x[:, None, :] - nodes)[:,:,:,None]).squeeze() + nodes + T - x[:, None, :]   # (Np, K, 3)
-                d_xyz = (weights[:,:,None] * d_xyz_K).sum(dim=1)    # (Np, 3)
-            else:
-                point_labels = self._refresh_point_labels(x)
-                ptransform = gtransform[point_labels, :, :]                      # (Np, 3, 4)
-                R = ptransform[:, :, :3]
-                T = ptransform[:, :, 3]
-                nodes = self.gf_nodes_xyz[point_labels, :]                       # (Np, 3)
-                d_xyz = (R @ (x - nodes)[:,:,None]).squeeze() + nodes + T - x   # (Np, 3)
-
-            ### Optional: Rotate per-gaussian orientation
-            if (self.gflow_local_rot is True) and (Q is not None):
-                ### 1. Get quaternion dQ from rotation matrix (Use compiled func to get faster speed)
-                # dQ_groups = rotation_matrix_to_quaternion(gtransform[:, :, :3]) # (Ng, 3, 3) -> (Ng, 4)
-                # dQ_groups = rotation_matrix_to_quaternion_fast(gtransform[:, :, :3]) # (Ng, 3, 3) -> (Ng, 4)
-                dQ_groups = self.rotation_matrix_to_quaternion_fast(gtransform[:, :, :3]) # (Ng, 3, 3) -> (Ng, 4)
-                ### 2. Map dQ to all gaussian points
-                point_labels = self._refresh_point_labels(x)
-                dQ = dQ_groups[point_labels, :]
-                ### 3. Get rotation/pose after rotation (Use compiled func to get faster speed)
-                # new_rotation = quaternion_multiply(dQ, Q)
-                # new_rotation = quaternion_multiply_fast(dQ, Q)
-                new_rotation = self.quaternion_multiply_fast(dQ, Q)
-                ### 4. Normalize to get difference/d_rotation as input of De3DGS's gaussian_render/__init__.py
-                d_rotation = torch.nn.functional.normalize(new_rotation) - Q
-
-                if torch.isnan(d_rotation).any().item() or torch.isinf(d_rotation).any().item():
-                    import pdb
-                    pdb.set_trace()
-                return d_xyz, d_rotation
-            
-            else:
-                return d_xyz
+            # 3) Gather each point's group transform and group node center.
+            ptransform = gtransform[point_labels, :, :]                      # (Np, 3, 4)
+            R = ptransform[:, :, :3]
+            T = ptransform[:, :, 3]
+            nodes = self.gf_nodes_xyz[point_labels, :]                       # (Np, 3)
+            # 4) Local rigid warp around node center:
+            #    x' = R @ (x - node) + node + T
+            #    d_xyz = x' - x
+            d_xyz = (R @ (x - nodes)[:,:,None]).squeeze() + nodes + T - x   # (Np, 3)
+            ## TODO: End of local rigid transform
+            return d_xyz
 
 
 def exp_so3_batch(w):
@@ -1163,15 +1046,8 @@ def do_group_flow(gaussians, opt, dataset, scene, deform):
     gaussians._xyz = torch.nn.Parameter(means3D_0.clone().detach().requires_grad_(True))
     gaussians.training_setup(opt)
 
-    if opt.gflow_opt == 1:
-        gflow_model = GroupFlowModel()
-        gflow_model.set_model(gflow_dict, training_args=opt)
-    elif opt.gflow_opt == 2:
-        gflow_model = GroupFlowModel_v2()
-        gflow_model.set_model(gflow_dict, training_args=opt, scene_scale=scene.cameras_extent)
-    else:
-        print("gflow_opt not defined, please check your config.")
-        exit()
+    gflow_model = GroupFlowModel_v2()
+    gflow_model.set_model(gflow_dict, training_args=opt, scene_scale=scene.cameras_extent)
 
     debug = False
     if debug:
@@ -1180,10 +1056,7 @@ def do_group_flow(gaussians, opt, dataset, scene, deform):
         viewpoint_stack.sort(key=lambda obj: obj.fid)
 
         ### 1. New Deform Network
-        if opt.gflow_opt == 1:
-            d_xyz = gflow_model.step_t(viewpoint_stack[frame_id].fid)   # 6-DoF: (Np, 4, 4), non-6-DoF: (Np, 3)
-        elif opt.gflow_opt == 2:
-            d_xyz = gflow_model.step_t(means3D_0, viewpoint_stack[frame_id].fid)
+        d_xyz = gflow_model.step_t(means3D_0, viewpoint_stack[frame_id].fid)
 
         if len(d_xyz.shape) > 2:    # 6dof
             means3D = from_homogenous(torch.bmm(d_xyz, to_homogenous(means3D_0).unsqueeze(-1)).squeeze(-1))
@@ -1211,34 +1084,24 @@ def do_group_flow(gaussians, opt, dataset, scene, deform):
     return gflow_model
 
 
-def step_group_flow(gflow_model, opt, fid, gaussians, use_precomputed_interp=False):
-
-    if gflow_model.version == 1:
-        fix_gflow_flag = True
-    elif gflow_model.version == 2:
-        fix_gflow_flag = False
-
-    if gflow_model.version == 1:
+def step_group_flow(gflow_model, fid, gaussians, use_precomputed_interp=False):
+    if gflow_model.gflow_local_rot == False:
         d_rotation, d_scaling = 0.0, 0.0
-        d_xyz = gflow_model.step_t(fid, use_precomputed_interp=use_precomputed_interp)
-        if torch.is_tensor(d_xyz):
-            if fix_gflow_flag:
-                d_xyz = d_xyz.detach()
-    elif gflow_model.version == 2:
-        if gflow_model.gflow_local_rot == False:
-            d_rotation, d_scaling = 0.0, 0.0                
-            d_xyz = gflow_model.step_t(gaussians.get_xyz.detach(), fid, use_precomputed_interp=use_precomputed_interp)
-            if torch.is_tensor(d_xyz):
-                if fix_gflow_flag:
-                    d_xyz = d_xyz.detach()
-        else:
-            d_scaling = 0.0
-            d_xyz, d_rotation = gflow_model.step_t(gaussians.get_xyz.detach(), fid, Q=gaussians.get_rotation.detach(), use_precomputed_interp=use_precomputed_interp)
-            if torch.is_tensor(d_xyz):
-                if fix_gflow_flag:
-                    d_xyz = d_xyz.detach()
-                    d_rotation = d_rotation.detach()
-                elif gflow_model.gflow_local_rot_for_train == False:   # if use gflow_local_rot as another gradient branch for training, if True, it would be slower. Default: False
-                    d_rotation = d_rotation.detach()
-    
+        d_xyz = gflow_model.step_t(
+            gaussians.get_xyz.detach(),
+            fid,
+            use_precomputed_interp=use_precomputed_interp,
+        )
+    else:
+        d_scaling = 0.0
+        d_xyz, d_rotation = gflow_model.step_t(
+            gaussians.get_xyz.detach(),
+            fid,
+            Q=gaussians.get_rotation.detach(),
+            use_precomputed_interp=use_precomputed_interp,
+        )
+        if torch.is_tensor(d_xyz) and gflow_model.gflow_local_rot_for_train == False:
+            # If local-rot is not used as an extra gradient branch, keep this detached.
+            d_rotation = d_rotation.detach()
+
     return d_xyz, d_rotation, d_scaling

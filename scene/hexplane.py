@@ -83,6 +83,15 @@ def interpolate_ms_features(pts: torch.Tensor,
         num_levels = len(ms_grids)
     multi_scale_interp = [] if concat_features else 0.
     grid: nn.ParameterList
+
+    ## TODO: Implement multi-scale feature interpolation
+    # For each resolution level:
+    # 1) bilinearly sample each factor plane at the queried coordinate pair
+    # 2) multiply sampled plane features to get one factorized feature vector
+    # 3) merge levels by concatenation (or summation when concat_features=False)
+    #
+    # This yields a coarse-to-fine representation:
+    # lower-res planes capture global motion/layout, higher-res planes add detail.
     for scale_id,  grid in enumerate(ms_grids[:num_levels]):
         interp_space = 1.
         for ci, coo_comb in enumerate(coo_combs):
@@ -100,7 +109,7 @@ def interpolate_ms_features(pts: torch.Tensor,
             multi_scale_interp.append(interp_space)
         else:
             multi_scale_interp = multi_scale_interp + interp_space
-
+    ## TODO: End of multi-scale feature interpolation
     if concat_features:
         multi_scale_interp = torch.cat(multi_scale_interp, dim=-1)
     return multi_scale_interp

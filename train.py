@@ -81,45 +81,74 @@ def _apply_speede_tricks_preset(opt):
     """Enable all three SpeeDe3DGS-inspired tricks with one flag."""
     if not opt.enable_speede_tricks:
         return
-    print("[SpeeDeTricks] Enabled score-pruning + TSS + VC.")
+    print("[SpeeDeTricks] Enabled score-pruning + TSS + VC (ratios: 0.30/0.15).")
     opt.speede_use_tss = True
     opt.speede_use_vc = True
+    # Match run_d3dgs_dnerf.sh defaults when only --enable_speede_tricks is set.
+    opt.speede_densify_prune_ratio = 0.30
+    opt.speede_after_densify_prune_ratio = 0.15
 
 
 def _score_func_speede(
     scores, view, gaussians, opt, pipe, background, deform, time_interval, is_6dof, gflow_model=None
 ):
     """Compute score contribution from one camera view."""
+    # Create per-Gaussian score proxies (leaf tensor) so rasterization can expose
+    # gradients w.r.t. each Gaussian's contribution in this single view.
     img_scores = torch.zeros_like(scores, requires_grad=True)
 
+    # Normalized frame timestamp for this camera.
     fid = view.fid
+    # Current number of Gaussians.
     n_pts = gaussians.get_xyz.shape[0]
+    # Broadcast timestamp to per-Gaussian time input shape: (N, 1).
     time_input = fid.unsqueeze(0).expand(n_pts, -1)
+    # TSS: optional timestamp jitter scaled by frame interval to probe nearby times.
     tss_noise = (
+        # Draw one Gaussian noise sample, broadcast to all Gaussians, then scale.
         torch.randn(1, 1, device="cuda").expand(n_pts, -1) * time_interval
+        # If TSS is disabled, use exact timestamp (no perturbation).
         if opt.speede_use_tss else 0.0
     )
+    
+    ## TODO: Calculate scores for each Gaussian
+
+    # Deformation is inference-only during scoring (no gradients through motion net).
     with torch.no_grad():
+        # If GroupFlow is active, use grouped rigid motion instead of deform MLP.
         if gflow_model is not None:
-            d_xyz, d_rotation, d_scaling = step_group_flow(gflow_model, opt, fid, gaussians)
+            d_xyz, d_rotation, d_scaling = step_group_flow(gflow_model, fid, gaussians)
+        # Otherwise use deform network at (optionally) jittered timestamp.
         else:
             d_xyz, d_rotation, d_scaling = deform.step(gaussians.get_xyz.detach(), time_input + tss_noise)
 
+    # Render this view while injecting `img_scores` into the rasterizer so that
+    # image gradients can backpropagate to per-Gaussian score slots.
     render_pkg = render(
         view, gaussians, pipe, background,
         d_xyz, d_rotation, d_scaling, is_6dof,
         scores=img_scores)
+    # RGB rendering result for this camera.
     image = render_pkg["render"]
+    # Visibility mask of Gaussians that contributed in this view.
     vis = render_pkg["visibility_filter"]
 
+    # Scalarize output and backprop to obtain d(sum(image))/d(img_scores).
     image.sum().backward()
+    # Preferred path: rasterizer exposes score gradients directly.
     if img_scores.grad is not None:
+        # Accumulate this view's sensitivity into global running scores.
         with torch.no_grad():
             scores += img_scores.grad
     else:
         # Fallback for rasterizers without score-gradient output.
         with torch.no_grad():
+            # Visibility-count proxy: give +1 score to visible Gaussians.
             scores[vis] += 1.0
+
+    ## TODO end of score calculation
+    
+    # Return visibility for optional view-count normalization in caller.
     return vis
 
 
@@ -260,16 +289,24 @@ def scene_reconstruction(dataset, opt, hyper, pipe,
                 torch.nan_to_num(image, nan=0.5, posinf=1.0, neginf=0.0),
                 0.0, 1.0,
             )
+
+        ## TODO: Implement L1 loss and SSIM loss
+        # Supervise rendered RGB with the standard 3DGS photometric objective:
+        #   loss_photo = (1 - lambda_dssim) * L1 + lambda_dssim * (1 - SSIM)
+        # L1 captures per-pixel color fidelity; SSIM encourages structural similarity.
         Ll1 = l1_loss(image_for_loss, gt_image)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (
             1.0 - ssim(image_for_loss, gt_image)
         )
 
-        # 4DGS HexPlane TV regularisation (fine stage only)
+        # 4DGS-only regularization (fine stage):
+        # adds HexPlane priors (spatial smoothness + temporal smoothness + time-plane L1)
+        # to stabilize dynamic deformation and reduce flicker/noise.
         if stage == "fine" and dataset.method == "4dgs":
             reg = deform.compute_regulation()
             if torch.isfinite(reg).all():
                 loss = loss + reg
+        ## TODO: End of 4DGS HexPlane TV regularisation
 
         # ── NaN guard: skip backward if loss invalid (original restarts; ──────
         # ── we skip to preserve the last good weights)                   ──────
@@ -444,7 +481,7 @@ def training_deformable(dataset, opt, pipe, hyper, testing_iterations, saving_it
             fid_input = fid
             if opt.gflow_noise_flag and not dataset.is_blender:
                 fid_input = torch.clamp(fid + torch.randn(1, device='cuda') * time_interval * smooth_term(iteration), 0.0, 1.0)
-            d_xyz, d_rotation, d_scaling = step_group_flow(gflow_model, opt, fid_input, gaussians)
+            d_xyz, d_rotation, d_scaling = step_group_flow(gflow_model, fid_input, gaussians)
         else:
             N = gaussians.get_xyz.shape[0]
             time_input = fid.unsqueeze(0).expand(N, -1)
@@ -678,7 +715,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed,
 
                     if gflow_model is not None and opt is not None:
                         d_xyz, d_rotation, d_scaling = step_group_flow(
-                            gflow_model, opt, fid, scene.gaussians,
+                            gflow_model, fid, scene.gaussians,
                             use_precomputed_interp=True)
                     elif stage == "fine":
                         d_xyz, d_rotation, d_scaling = deform.step(

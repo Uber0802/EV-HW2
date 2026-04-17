@@ -163,7 +163,6 @@ class OptimizationParams(ParamGroup):
         self.gflow_flag = False
         self.gflow_iteration = 15000
         self.gflow_num = 2048
-        self.gflow_opt = 2
         self.gflow_xyz_lr = 1e-5
         self.gflow_rotation_lr = 1e-7
         self.gflow_translation_lr = 1e-7

@@ -67,6 +67,12 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, d_
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
+
+    ## TODO: Combine deformation and canonical Gaussian positions
+    # Unify deformation conventions for both methods:
+    # - deformable 3DGS: network predicts deltas, so use canonical + delta.
+    # - 4DGS fine stage: network predicts absolute attributes, so use them directly
+    #   when absolute_deform=True.
     if absolute_deform and torch.is_tensor(d_xyz):
         # 4DGS path: deformation network outputs absolute values directly.
         # Do NOT add canonical — gradient flows only through the deformation network.
@@ -95,6 +101,7 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, d_
     else:
         scales = pc.get_scaling + d_scaling
         rotations = pc.get_rotation + d_rotation
+    ## TODO: End of combining deformation and canonical Gaussian positions
 
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.

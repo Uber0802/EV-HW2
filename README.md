@@ -6,6 +6,15 @@ For a **code-level map** (training dispatch, deformable vs 4DGS, SpeeDe, GroupFl
 
 ---
 
+## Problem
+
+Homework instructions are split into two parts:
+
+- Base problem: [`BASE_PROBLEM.md`](BASE_PROBLEM.md)
+- Advanced problem: [`ADVANCED_PROBLEM.md`](ADVANCED_PROBLEM.md)
+
+---
+
 ## Installation
 
 ### 1. Clone and submodules
@@ -23,22 +32,17 @@ You need at least:
 
 ### 2. Conda environment and Python dependencies
 
-Create a conda env (example name `ev_hw2`, Python 3.10), then either:
-
-**Option A — `setup_env.sh` (recommended)**  
-Uncomment the “create env” / “CUDA toolkit” sections in [`setup_env.sh`](setup_env.sh) if you need them, set `TORCH_CUDA_ARCH_LIST` for your GPU (see comments in the script), then:
-
-```bash
-conda activate ev_hw2   # after creating the env
-bash setup_env.sh
-```
-
-**Option B — manual**
+Create a conda env (example name `ev_hw2`, Python 3.10), then:
 
 ```bash
 conda create -n ev_hw2 python=3.10 -y
 conda activate ev_hw2
-# Optional: CUDA 12.8 toolkit in conda for nvcc (see setup_env.sh)
+# Install CUDA toolkit in this env so nvcc exists for extension builds
+conda install -c nvidia/label/cuda-12.8.0 cuda-toolkit -y
+export CUDA_HOME="$CONDA_PREFIX"
+export PATH="$CUDA_HOME/bin:$PATH"
+# Optional, but recommended on mixed lab machines
+export TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9;9.0;12.0"
 pip install -r requirements.txt
 pip install submodules/depth-diff-gaussian-rasterization --no-build-isolation
 pip install submodules/simple-knn --no-build-isolation
@@ -46,7 +50,39 @@ pip install submodules/simple-knn --no-build-isolation
 
 [`requirements.txt`](requirements.txt) pins PyTorch **2.7.0+cu128** and runtime packages. For other CUDA versions, adjust the torch lines using [PyTorch Get Started](https://pytorch.org/get-started/locally/). `requirement.txt` is a thin wrapper that includes `requirements.txt`.
 
+If you see `No such file or directory: '/opt/cuda/.../bin/nvcc'`, your machine does not have a usable CUDA toolkit path for builds. Install `cuda-toolkit` in the conda env and set `CUDA_HOME="$CONDA_PREFIX"` as shown above.
+
 An alternative is [`environment.yaml`](environment.yaml) (`conda env create -f environment.yaml`), then build the two CUDA extensions as above.
+
+### Multi-machine GPU compatibility (RTX 4090, RTX 5090, etc.)
+
+When you switch between machines/GPUs, re-build CUDA extensions in that machine's environment.
+
+- **RTX 40xx / Ada (e.g. 4090)**: `TORCH_CUDA_ARCH_LIST=8.9` works.
+- **RTX 50xx / Blackwell (e.g. 5090)**: you must use **nvcc 12.8+** and include `12.0` in `TORCH_CUDA_ARCH_LIST`.
+- **Mixed lab machines**: use `7.5;8.0;8.6;8.9;9.0;12.0` plus CUDA 12.8 toolkit.
+
+Quick check:
+
+```bash
+nvidia-smi
+nvcc --version
+python -c "import torch; print(torch.cuda.get_device_name(0), torch.cuda.get_device_capability(0))"
+```
+
+If you hit `cudaErrorNoKernelImageForDevice`, your extension was built without your GPU architecture. Rebuild with the correct toolchain/arch list:
+
+```bash
+conda activate ev_hw2
+conda install -c nvidia/label/cuda-12.8.0 cuda-toolkit -y
+export CUDA_HOME="$CONDA_PREFIX"
+export PATH="$CUDA_HOME/bin:$PATH"
+export TORCH_CUDA_ARCH_LIST="12.0"   # for RTX 5090 / Blackwell
+
+pip uninstall -y diff_gaussian_rasterization simple_knn
+pip install --no-cache-dir --force-reinstall submodules/depth-diff-gaussian-rasterization --no-build-isolation
+pip install --no-cache-dir --force-reinstall submodules/simple-knn --no-build-isolation
+```
 
 ---
 
@@ -84,12 +120,11 @@ This runs `train.py` with `--method deformable`, then `render.py`, then `metrics
 Uncomment the block in `run_d3dgs_dnerf.sh` (lines 27–32) to enable `--enable_speede_tricks` and related flags, for example:
 
 - `--speede_prune_from_iter`, `--speede_prune_interval`
-- `--speede_densify_prune_ratio`, `--speede_after_densify_prune_ratio`
-- `--speede_use_tss --speede_use_vc` (temporal sensitivity sampling and view-count normalization)
+
 
 #### GroupFlow (optional)
 
-Uncomment the block in `run_d3dgs_dnerf.sh` (lines 33–36), e.g. `--gflow_flag`, `--gflow_iteration`, `--gflow_num`, `--gflow_opt`.
+Uncomment the block in `run_d3dgs_dnerf.sh` (lines 30–32), e.g. `--gflow_flag`, `--gflow_iteration`, `--gflow_num`.
 
 **Rendering with GroupFlow:** if you trained with GroupFlow, use `--gflow_flag` on `render.py` as well (see the commented example in `run_d3dgs_dnerf.sh` lines 44–46).
 
